@@ -1,0 +1,3 @@
+sk-f7317b1f969b47b58946e2c421d40edc
+https://api.deepseek.com
+deepseek-v4-pro

@@ -1,0 +1,564 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Pixel Novel Engine — 像素小说世界</title>
+  <link rel="stylesheet" href="styles/main.css?v=2">
+</head>
+<body>
+  <div id="app">
+    <div id="scene-panel" class="panel">
+      <canvas id="scene-canvas"></canvas>
+      <div id="interaction-overlay"></div>
+      <!-- 世界创建面板（内嵌在场景区域中） -->
+      <div id="world-creation-panel" class="world-creation-panel hidden">
+        <div class="world-creation-header">创建你的世界</div>
+        <div class="world-creation-body">
+          <p>欢迎来到 Pixel Novel Engine！</p>
+          <p>请描述你想创建的世界，例如：</p>
+          <ul>
+            <li>"我要一个高中校园剧，主角是转学生"</li>
+            <li>"创建一个赛博朋克都市，主角是黑客"</li>
+            <li>"古代武侠世界，主角是门派弟子"</li>
+          </ul>
+          <textarea id="world-input" rows="3" placeholder="描述你的世界..."></textarea>
+          <button id="world-create-btn">创建世界</button>
+        </div>
+      </div>
+    </div>
+    <div id="config-panel" class="panel"></div>
+    <div id="chat-panel" class="panel"></div>
+    <div id="narrative-panel" class="panel"></div>
+  </div>
+
+  <script type="module">
+    import { GameEngine } from './engine/GameEngine.js';
+    import { SceneRenderer } from './renderer/SceneRenderer.js';
+    import { CharacterRenderer } from './renderer/CharacterRenderer.js';
+    import { AnimationEngine } from './renderer/AnimationEngine.js';
+    import { stateManager } from './state/StateManager.js';
+    import { StorageManager } from './state/StorageManager.js';
+    import { ConfigPanel } from './ui/ConfigPanel.js';
+    import { ChatPanel } from './ui/ChatPanel.js';
+    import { NarrativePanel } from './ui/NarrativePanel.js';
+    import { CharacterInteraction } from './ui/CharacterInteraction.js';
+    import { AIClient } from './ai/AIClient.js';
+    import { PromptBuilder } from './ai/PromptBuilder.js';
+    import { CommandParser } from './ai/CommandParser.js';
+    import { eventBus } from './engine/EventBus.js';
+
+    // ========== 空白初始状态 ==========
+    const EMPTY_STATE = {
+      version: '1.0',
+      story: {
+        title: '',
+        currentSceneId: null,
+        sceneTree: {
+          master: null,
+          unlocked: []
+        },
+        flags: {},
+        history: []
+      },
+      characters: {},
+      player: {
+        name: '玩家',
+        inventory: [],
+        stats: {}
+      },
+      config: {
+        apiEndpoint: 'https://api.openai.com/v1',
+        apiKey: '',
+        model: 'gpt-4o-mini',
+        temperature: 0.8,
+        maxTokens: 2000
+      }
+    };
+
+    // ========== 初始化 ==========
+    const canvas = document.getElementById('scene-canvas');
+    const animEngine = new AnimationEngine();
+    const sceneRenderer = new SceneRenderer(canvas);
+    const charRenderer = new CharacterRenderer(animEngine);
+    const gameEngine = new GameEngine(sceneRenderer, charRenderer, animEngine, stateManager);
+
+    const configPanel = new ConfigPanel('config-panel');
+    const chatPanel = new ChatPanel('chat-panel');
+    const narrativePanel = new NarrativePanel('narrative-panel');
+    const charInteraction = new CharacterInteraction(canvas, gameEngine);
+
+    const aiClient = new AIClient();
+    const promptBuilder = new PromptBuilder();
+    const commandParser = new CommandParser();
+
+    let worldCreated = false;
+
+    // ========== 世界创建面板 ==========
+    const worldPanel = document.getElementById('world-creation-panel');
+    const worldInput = document.getElementById('world-input');
+    const worldCreateBtn = document.getElementById('world-create-btn');
+
+    function showWorldPanel() {
+      worldPanel.classList.remove('hidden');
+      worldInput.focus();
+    }
+
+    function hideWorldPanel() {
+      worldPanel.classList.add('hidden');
+    }
+
+    worldCreateBtn.addEventListener('click', async () => {
+      const text = worldInput.value.trim();
+      if (!text) return;
+
+      const config = stateManager.getState().config;
+      if (!config.apiKey) {
+        chatPanel.addMessage('system', '请先配置 API Key（在右上角配置面板中填写）');
+        return;
+      }
+
+      hideWorldPanel();
+      chatPanel.addMessage('system', '正在创建世界，请稍候...');
+      chatPanel.setTyping(true);
+
+      try {
+        aiClient.configure(config);
+        const messages = promptBuilder.buildStoryPrompt(text, stateManager.getState());
+        const responseText = await aiClient.sendChat(messages);
+
+        chatPanel.setTyping(false);
+
+        // Debug: show raw response
+        if (!responseText) {
+          chatPanel.addMessage('system', 'AI 返回空响应，请检查 API 配置和模型是否支持');
+          showWorldPanel();
+          return;
+        }
+
+        chatPanel.addMessage('assistant', responseText.substring(0, 300) + (responseText.length > 300 ? '...' : ''));
+
+        const commands = commandParser.parse(responseText);
+
+        if (!commands.valid) {
+          narrativePanel.append(`[AI 解析错误: ${commands.errors.join(', ')}]`, 'system');
+          showWorldPanel();
+          return;
+        }
+
+        // 应用命令创建世界
+        applyWorldCreation(commands);
+        worldCreated = true;
+
+        // 显示 narrative
+        if (commands.narrative) {
+          narrativePanel.append(commands.narrative, 'narration');
+        }
+
+        // 显示角色对话
+        if (commands.character_commands) {
+          commands.character_commands.forEach(cmd => {
+            if (cmd.action === 'speak' && cmd.params?.text) {
+              const char = stateManager.getState().characters?.[cmd.target];
+              narrativePanel.append(cmd.params.text, 'dialogue', { speaker: char?.displayName || char?.name || cmd.target });
+            }
+          });
+        }
+
+        // 显示选择
+        if (commands.choices && commands.choices.length > 0) {
+          showChoices(commands.choices);
+        }
+
+        StorageManager.save(stateManager.getState());
+
+        // 启动待机动画
+        const newState = stateManager.getState();
+        const presentChars = newState.story.sceneTree.master?.charactersPresent || [];
+        presentChars.forEach(id => {
+          if (newState.characters?.[id]) {
+            animEngine.playIdle(id);
+          }
+        });
+
+        chatPanel.addMessage('system', '世界创建完成！你可以在下方输入框继续推进剧情。');
+
+      } catch (error) {
+        chatPanel.setTyping(false);
+        chatPanel.addMessage('system', `创建失败: ${error.message}`);
+        showWorldPanel();
+      }
+    });
+
+    worldInput.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' && !e.shiftKey) {
+        e.preventDefault();
+        worldCreateBtn.click();
+      }
+    });
+
+    // ========== 加载存档或初始化 ==========
+    function initState() {
+      const saved = StorageManager.load('autosave');
+      if (saved && saved.story?.sceneTree?.master) {
+        stateManager.dispatch({ type: 'INIT_STATE', payload: saved });
+        worldCreated = true;
+        narrativePanel.append('[系统] 已恢复自动存档', 'system');
+
+        // 恢复剧情历史
+        const state = stateManager.getState();
+        state.story.history.forEach(entry => {
+          if (entry.type === 'narration') {
+            narrativePanel.append(entry.text, 'narration', entry.meta);
+          } else if (entry.type === 'dialogue') {
+            narrativePanel.append(entry.text, 'dialogue', entry.meta);
+          }
+        });
+      } else {
+        stateManager.dispatch({ type: 'INIT_STATE', payload: JSON.parse(JSON.stringify(EMPTY_STATE)) });
+      }
+
+      // 加载配置
+      const savedConfig = StorageManager.loadConfig();
+      if (savedConfig) {
+        stateManager.dispatch({ type: 'SET_CONFIG', payload: savedConfig });
+        aiClient.configure(savedConfig);
+      }
+    }
+
+    // ========== 应用世界创建命令 ==========
+    function applyWorldCreation(commands) {
+      const payload = {};
+
+      // 从 scene_command 中提取场景数据
+      if (commands.scene_command && commands.scene_command.action === 'create') {
+        const sc = commands.scene_command;
+        payload.master = {
+          id: sc.target,
+          name: sc.params.name || sc.target,
+          type: sc.params.type || 'outdoor',
+          parentId: null,
+          unlocked: true,
+          environment: sc.params.environment || { timeOfDay: 'day', weather: 'clear', palette: 'urban' },
+          layout: sc.params.layout || { groundType: 'grass', skyType: 'clear', props: [] },
+          charactersPresent: sc.params.charactersPresent || [],
+          ambientDescription: sc.params.ambientDescription || ''
+        };
+      }
+
+      // 从 character_commands 中提取角色数据
+      const newChars = {};
+      if (commands.character_commands) {
+        commands.character_commands.forEach(cmd => {
+          if (cmd.action === 'create' && cmd.params?.characterData) {
+            const char = cmd.params.characterData;
+            newChars[char.id] = char;
+            // 确保角色在场景的 charactersPresent 中
+            if (payload.master && !payload.master.charactersPresent.includes(char.id)) {
+              payload.master.charactersPresent.push(char.id);
+            }
+          }
+        });
+      }
+
+      if (Object.keys(newChars).length > 0) {
+        payload.characters = newChars;
+      }
+
+      // 从 state_updates 中提取 flags
+      if (commands.state_updates?.flags) {
+        payload.flags = commands.state_updates.flags;
+      }
+
+      // 从 narrative 中提取标题（第一行）
+      if (commands.narrative) {
+        const firstLine = commands.narrative.split('\n')[0].substring(0, 30);
+        payload.title = firstLine;
+      }
+
+      stateManager.dispatch({ type: 'CREATE_WORLD', payload });
+    }
+
+    // ========== 事件绑定 ==========
+
+    eventBus.on('config:updated', (config) => {
+      stateManager.dispatch({ type: 'SET_CONFIG', payload: config });
+      aiClient.configure(config);
+    });
+
+    let pendingCharacterContext = null;
+
+    eventBus.on('chat:user_input', async ({ text }) => {
+      if (!worldCreated) {
+        chatPanel.addMessage('system', '请先创建世界（在左侧场景区域填写世界描述）');
+        showWorldPanel();
+        return;
+      }
+      await processTurn(text, pendingCharacterContext);
+      pendingCharacterContext = null;
+    });
+
+    eventBus.on('character:clicked', ({ characterId, name }) => {
+      pendingCharacterContext = { characterId, characterName: name };
+      chatPanel.addMessage('system', `已选择 [${name}]，请在下方输入你想说的话或做的事。`);
+    });
+
+    eventBus.on('character:action', ({ action, characterId }) => {
+      const state = stateManager.getState();
+      const char = state.characters?.[characterId];
+      if (!char) return;
+
+      if (action === 'talk') {
+        pendingCharacterContext = { characterId, characterName: char.displayName || char.name };
+        chatPanel.addMessage('system', `与 [${char.displayName || char.name}] 对话中...`);
+      }
+    });
+
+    eventBus.on('chat:system_message', ({ text }) => {
+      chatPanel.addMessage('system', text);
+    });
+
+    // ========== 核心回合处理 ==========
+    async function processTurn(userInput, characterContext) {
+      const state = stateManager.getState();
+      const config = state.config;
+
+      if (!config.apiKey) {
+        chatPanel.addMessage('system', '请先配置 API Key');
+        return;
+      }
+
+      stateManager.dispatch({ type: 'PLAYER_INPUT', payload: { text: userInput } });
+      chatPanel.setTyping(true);
+
+      try {
+        aiClient.configure(config);
+        const messages = promptBuilder.buildStoryPrompt(userInput, state, characterContext || {});
+        const responseText = await aiClient.sendChat(messages);
+
+        chatPanel.setTyping(false);
+        chatPanel.addMessage('assistant', responseText.substring(0, 500) + (responseText.length > 500 ? '...' : ''));
+
+        const commands = commandParser.parse(responseText);
+
+        if (!commands.valid) {
+          narrativePanel.append(`[AI 解析错误: ${commands.errors.join(', ')}]`, 'system');
+          return;
+        }
+
+        // 应用命令
+        stateManager.dispatch({ type: 'APPLY_AI_COMMANDS', payload: commands });
+
+        // 处理新创建的场景
+        if (commands.scene_command?.action === 'create') {
+          const sc = commands.scene_command;
+          const newScene = {
+            id: sc.target,
+            name: sc.params.name || sc.target,
+            type: sc.params.type || 'outdoor',
+            parentId: sc.params.parentId || state.story.currentSceneId,
+            unlocked: true,
+            environment: sc.params.environment || { timeOfDay: 'day', weather: 'clear', palette: 'urban' },
+            layout: sc.params.layout || { groundType: 'grass', skyType: 'clear', props: [] },
+            charactersPresent: sc.params.charactersPresent || [],
+            ambientDescription: sc.params.ambientDescription || ''
+          };
+          stateManager.dispatch({ type: 'CREATE_WORLD', payload: { unlocked: [newScene] } });
+        }
+
+        // 处理新创建的角色
+        if (commands.character_commands) {
+          commands.character_commands.forEach(cmd => {
+            if (cmd.action === 'create' && cmd.params?.characterData) {
+              const char = cmd.params.characterData;
+              stateManager.dispatch({ type: 'CREATE_WORLD', payload: { characters: { [char.id]: char } } });
+              // 将角色添加到当前场景
+              const currentScene = gameEngine.getCurrentScene(stateManager.getState());
+              if (currentScene && !currentScene.charactersPresent.includes(char.id)) {
+                currentScene.charactersPresent.push(char.id);
+              }
+            }
+          });
+        }
+
+        // 显示 narrative
+        if (commands.narrative) {
+          narrativePanel.append(commands.narrative, 'narration');
+        }
+
+        // 显示角色对话
+        if (commands.character_commands) {
+          commands.character_commands.forEach(cmd => {
+            if (cmd.action === 'speak' && cmd.params?.text) {
+              const char = stateManager.getState().characters?.[cmd.target];
+              narrativePanel.append(cmd.params.text, 'dialogue', { speaker: char?.displayName || char?.name || cmd.target });
+            }
+          });
+        }
+
+        // 显示选择
+        if (commands.choices && commands.choices.length > 0) {
+          showChoices(commands.choices);
+        }
+
+        // 自动存档
+        StorageManager.save(stateManager.getState());
+
+        // 启动角色待机动画
+        const newState = stateManager.getState();
+        const currentScene = gameEngine.getCurrentScene(newState);
+        const presentChars = currentScene?.charactersPresent || [];
+        presentChars.forEach(id => {
+          if (newState.characters?.[id]?.state?.pose === 'idle') {
+            animEngine.playIdle(id);
+          }
+        });
+
+        // 不再自动清除场景缓存，改为手动刷新
+        // sceneRenderer.clearCache();
+
+      } catch (error) {
+        chatPanel.setTyping(false);
+        chatPanel.addMessage('system', `请求失败: ${error.message}`);
+        console.error('AI request failed:', error);
+      }
+    }
+
+    function showChoices(choices) {
+      const narrativeContent = document.getElementById('narrative-content');
+      const container = document.createElement('div');
+      container.className = 'choice-container';
+
+      choices.forEach(choice => {
+        const btn = document.createElement('button');
+        btn.className = 'choice-btn';
+        btn.textContent = choice.text;
+        btn.title = choice.hint || '';
+        btn.addEventListener('click', () => {
+          container.remove();
+          processTurn(choice.text);
+        });
+        container.appendChild(btn);
+      });
+
+      narrativeContent.appendChild(container);
+      narrativeContent.scrollTop = narrativeContent.scrollHeight;
+    }
+
+    // ========== 导出/导入功能 ==========
+    function setupExportImport() {
+      const configPanelEl = document.getElementById('config-panel');
+      const form = configPanelEl.querySelector('.config-form');
+
+      const exportBtn = document.createElement('button');
+      exportBtn.textContent = '导出存档';
+      exportBtn.addEventListener('click', () => {
+        const json = StorageManager.exportToJSON(stateManager.getState());
+        const blob = new Blob([json], { type: 'application/json' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `pixel_novel_save_${Date.now()}.json`;
+        a.click();
+        URL.revokeObjectURL(url);
+      });
+
+      const importBtn = document.createElement('button');
+      importBtn.textContent = '导入存档';
+      importBtn.addEventListener('click', () => {
+        const input = document.createElement('input');
+        input.type = 'file';
+        input.accept = '.json';
+        input.addEventListener('change', (e) => {
+          const file = e.target.files[0];
+          if (!file) return;
+          const reader = new FileReader();
+          reader.onload = (ev) => {
+            const imported = StorageManager.importFromJSON(ev.target.result);
+            if (imported) {
+              stateManager.dispatch({ type: 'INIT_STATE', payload: imported });
+              worldCreated = !!imported.story?.sceneTree?.master;
+              narrativePanel.clear();
+              narrativePanel.append('[系统] 存档已导入', 'system');
+              sceneRenderer.clearCache();
+              StorageManager.save(stateManager.getState());
+            } else {
+              alert('导入失败：无效的存档文件');
+            }
+          };
+          reader.readAsText(file);
+        });
+        input.click();
+      });
+
+      const resetBtn = document.createElement('button');
+      resetBtn.textContent = '重新开始';
+      resetBtn.addEventListener('click', () => {
+        if (confirm('确定要重新开始吗？当前进度将丢失。')) {
+          stateManager.dispatch({ type: 'INIT_STATE', payload: JSON.parse(JSON.stringify(EMPTY_STATE)) });
+          worldCreated = false;
+          narrativePanel.clear();
+          sceneRenderer.clearCache();
+          StorageManager.save(stateManager.getState());
+          showWorldPanel();
+        }
+      });
+
+      const newWorldBtn = document.createElement('button');
+      newWorldBtn.textContent = '新世界';
+      newWorldBtn.addEventListener('click', () => {
+        if (confirm('确定要创建新世界吗？当前进度将丢失。')) {
+          stateManager.dispatch({ type: 'INIT_STATE', payload: JSON.parse(JSON.stringify(EMPTY_STATE)) });
+          worldCreated = false;
+          narrativePanel.clear();
+          sceneRenderer.clearCache();
+          StorageManager.save(stateManager.getState());
+          showWorldPanel();
+        }
+      });
+
+      const refreshMapBtn = document.createElement('button');
+      refreshMapBtn.textContent = '刷新地图';
+      refreshMapBtn.addEventListener('click', () => {
+        sceneRenderer.clearCache();
+        chatPanel.addMessage('system', '地图已刷新');
+      });
+
+      form.appendChild(document.createElement('hr'));
+      form.appendChild(exportBtn);
+      form.appendChild(importBtn);
+      form.appendChild(resetBtn);
+      form.appendChild(newWorldBtn);
+      form.appendChild(refreshMapBtn);
+    }
+
+    // ========== 启动 ==========
+    try {
+      initState();
+      gameEngine.init(canvas);
+      setupExportImport();
+
+      // 如果没有世界，显示创建面板
+      if (!worldCreated) {
+        showWorldPanel();
+        narrativePanel.append('欢迎来到 Pixel Novel Engine！请先配置 API（右上角），然后在左侧场景区域创建你的世界。', 'system');
+      } else {
+        // 恢复角色动画
+        const state = stateManager.getState();
+        const currentScene = gameEngine.getCurrentScene(state);
+        const presentChars = currentScene?.charactersPresent || [];
+        presentChars.forEach(id => {
+          if (state.characters?.[id]) {
+            animEngine.playIdle(id);
+          }
+        });
+      }
+
+      console.log('Pixel Novel Engine initialized');
+    } catch (e) {
+      console.error('初始化失败:', e);
+      document.body.innerHTML = '<div style="padding:20px;color:#fff;font-family:monospace;"><h2>初始化错误</h2><pre>' + e.stack + '</pre></div>';
+    }
+  </script>
+</body>
+</html>
